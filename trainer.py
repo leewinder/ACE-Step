@@ -33,6 +33,15 @@ torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision("high")
 
 
+def _get_device_type():
+    """Detect available hardware platform"""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 class Pipeline(LightningModule):
     def __init__(
         self,
@@ -210,7 +219,7 @@ class Pipeline(LightningModule):
         chunk_idx = 0
         for i in range(bsz):
             audio_chunks = chunk_hidden_states[
-                chunk_idx : chunk_idx + num_chunks_per_audio[i]
+                chunk_idx: chunk_idx + num_chunks_per_audio[i]
             ]
             audio_hidden = torch.cat(
                 audio_chunks, dim=0
@@ -287,7 +296,7 @@ class Pipeline(LightningModule):
         chunk_idx = 0
         for i in range(bsz):
             audio_chunks = chunk_hidden_states[
-                chunk_idx : chunk_idx + num_chunks_per_audio[i]
+                chunk_idx: chunk_idx + num_chunks_per_audio[i]
             ]
             audio_hidden = torch.cat(
                 audio_chunks, dim=0
@@ -325,7 +334,15 @@ class Pipeline(LightningModule):
         mert_ssl_hidden_states = None
         mhubert_ssl_hidden_states = None
         if train:
-            with torch.amp.autocast(device_type="cuda", dtype=dtype):
+            device_type = _get_device_type()
+            if device_type == "cuda":
+                with torch.amp.autocast(device_type="cuda", dtype=dtype):
+                    mert_ssl_hidden_states = self.infer_mert_ssl(target_wavs, wav_lengths)
+                    mhubert_ssl_hidden_states = self.infer_mhubert_ssl(
+                        target_wavs, wav_lengths
+                    )
+            else:
+                # MPS/CPU: no autocast needed
                 mert_ssl_hidden_states = self.infer_mert_ssl(target_wavs, wav_lengths)
                 mhubert_ssl_hidden_states = self.infer_mhubert_ssl(
                     target_wavs, wav_lengths
@@ -447,11 +464,16 @@ class Pipeline(LightningModule):
             train=True,
             train_dataset_path=self.hparams.dataset_path,
         )
+        # Detect device for platform-specific settings
+        device_type = _get_device_type()
+        use_pin_memory = device_type == "cuda"  # Only beneficial for CUDA
+        num_workers = self.hparams.num_workers if device_type == "cuda" else 0  # MPS needs 0
+
         return DataLoader(
             self.train_dataset,
             shuffle=True,
-            num_workers=self.hparams.num_workers,
-            pin_memory=True,
+            num_workers=num_workers,
+            pin_memory=use_pin_memory,
             collate_fn=self.train_dataset.collate_fn,
         )
 
@@ -779,8 +801,8 @@ class Pipeline(LightningModule):
         if (
             global_step % self.hparams.every_plot_step != 0
             or self.local_rank != 0
-            or torch.distributed.get_rank() != 0
-            or torch.cuda.current_device() != 0
+            or (torch.distributed.is_initialized() and torch.distributed.get_rank() != 0)
+            or (torch.cuda.is_available() and torch.cuda.current_device() != 0)
         ):
             return
         results = self.predict_step(batch)
@@ -832,20 +854,38 @@ def main(args):
     checkpoint_callback = ModelCheckpoint(
         monitor=None,
         every_n_train_steps=args.every_n_train_steps,
-        save_top_k=-1,
+        save_top_k=args.save_top_k,
     )
     # add datetime str to version
     logger_callback = TensorBoardLogger(
         version=datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + args.exp_name,
         save_dir=args.logger_dir,
     )
+
+    # Detect hardware
+    device_type = _get_device_type()
+
+    # Set defaults based on hardware
+    if device_type == "cuda":
+        accelerator = "gpu"
+        devices = args.devices
+        strategy = "ddp_find_unused_parameters_true"
+    elif device_type == "mps":
+        accelerator = "mps"
+        devices = 1
+        strategy = "auto"
+    else:
+        accelerator = "cpu"
+        devices = 1
+        strategy = "auto"
+
     trainer = Trainer(
-        accelerator="gpu",
-        devices=args.devices,
+        accelerator=accelerator,
+        devices=devices,
         num_nodes=args.num_nodes,
         precision=args.precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        strategy="ddp_find_unused_parameters_true",
+        strategy=strategy,
         max_epochs=args.epochs,
         max_steps=args.max_steps,
         log_every_n_steps=1,
@@ -886,5 +926,6 @@ if __name__ == "__main__":
     args.add_argument("--every_plot_step", type=int, default=2000)
     args.add_argument("--val_check_interval", type=int, default=None)
     args.add_argument("--lora_config_path", type=str, default="config/zh_rap_lora_config.json")
+    args.add_argument("--save_top_k", type=int, default=-1)
     args = args.parse_args()
     main(args)
