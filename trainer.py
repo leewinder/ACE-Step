@@ -8,6 +8,7 @@ import json
 import matplotlib
 import torch.nn.functional as F
 import torch.utils.data
+from enum import Enum
 from pytorch_lightning.core import LightningModule
 from torch.utils.data import DataLoader
 from acestep.schedulers.scheduling_flow_match_euler_discrete import (
@@ -33,13 +34,20 @@ torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision("high")
 
 
-def _get_device_type():
-    """Detect available hardware platform"""
-    if torch.cuda.is_available():
-        return "cuda"
-    elif torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+class DeviceType(Enum):
+    """ Device type constants for PyTorch operations """
+    CUDA = "cuda"
+    MPS = "mps"
+    CPU = "cpu"
+
+    @staticmethod
+    def detect() -> 'DeviceType':
+        """Detect available hardware platform"""
+        if torch.cuda.is_available():
+            return DeviceType.CUDA
+        if torch.backends.mps.is_available():
+            return DeviceType.MPS
+        return DeviceType.CPU
 
 
 class Pipeline(LightningModule):
@@ -334,9 +342,9 @@ class Pipeline(LightningModule):
         mert_ssl_hidden_states = None
         mhubert_ssl_hidden_states = None
         if train:
-            device_type = _get_device_type()
-            if device_type == "cuda":
-                with torch.amp.autocast(device_type="cuda", dtype=dtype):
+            device_type = DeviceType.detect()
+            if device_type == DeviceType.CUDA:
+                with torch.amp.autocast(device_type=device_type.value, dtype=dtype):
                     mert_ssl_hidden_states = self.infer_mert_ssl(target_wavs, wav_lengths)
                     mhubert_ssl_hidden_states = self.infer_mhubert_ssl(
                         target_wavs, wav_lengths
@@ -465,9 +473,9 @@ class Pipeline(LightningModule):
             train_dataset_path=self.hparams.dataset_path,
         )
         # Detect device for platform-specific settings
-        device_type = _get_device_type()
-        use_pin_memory = device_type == "cuda"  # Only beneficial for CUDA
-        num_workers = self.hparams.num_workers if device_type == "cuda" else 0  # MPS needs 0
+        device_type = DeviceType.detect()
+        use_pin_memory = device_type == DeviceType.CUDA  # Only beneficial for CUDA
+        num_workers = self.hparams.num_workers if device_type == DeviceType.CUDA else 0  # MPS needs 0
 
         return DataLoader(
             self.train_dataset,
@@ -496,7 +504,7 @@ class Pipeline(LightningModule):
                 mean=self.hparams.logit_mean,
                 std=self.hparams.logit_std,
                 size=(bsz,),
-                device="cpu",
+                device=DeviceType.CPU.value,
             )
             u = torch.nn.functional.sigmoid(u)
             indices = (u * self.scheduler.config.num_train_timesteps).long()
@@ -863,14 +871,14 @@ def main(args):
     )
 
     # Detect hardware
-    device_type = _get_device_type()
+    device_type = DeviceType.detect()
 
     # Set defaults based on hardware
-    if device_type == "cuda":
+    if device_type == DeviceType.CUDA:
         accelerator = "gpu"
         devices = args.devices
         strategy = "ddp_find_unused_parameters_true"
-    elif device_type == "mps":
+    elif device_type == DeviceType.MPS:
         accelerator = "mps"
         devices = 1
         strategy = "auto"
